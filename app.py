@@ -69,9 +69,10 @@ with st.sidebar:
     
     asin_extraction_placeholder = st.empty()
 
+    # Modificato per accettare CSV per Keepa
     uploaded_keepa_files = st.file_uploader(
-        "2. Carica File Keepa (anche multipli)", 
-        type=["xlsx"], 
+        "2. Carica File Keepa (CSV o XLSX, anche multipli)", 
+        type=["csv", "xlsx"], # Accetta entrambi i formati
         accept_multiple_files=True,
         key="keepa_files_uploader"
     )
@@ -160,7 +161,16 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
         for keepa_file_single in uploaded_keepa_files:
             try:
                 logger.info(f"Loading Keepa file: {keepa_file_single.name}")
-                df_single_keepa = io_layer.load_keepa_xlsx(keepa_file_single)
+                # Determina il tipo di file e chiama la funzione di caricamento appropriata
+                if keepa_file_single.name.lower().endswith(".csv"):
+                    df_single_keepa = io_layer.load_keepa_csv(keepa_file_single)
+                elif keepa_file_single.name.lower().endswith(".xlsx"):
+                    df_single_keepa = io_layer.load_keepa_xlsx(keepa_file_single)
+                else:
+                    st.warning(f"Formato file Keepa non supportato per '{keepa_file_single.name}'. Ignorato.")
+                    logger.warning(f"Unsupported Keepa file format for '{keepa_file_single.name}'. Skipped.")
+                    continue # Salta al prossimo file
+                
                 all_keepa_dataframes.append(df_single_keepa)
                 valid_keepa_files_count += 1
             except io_layer.InvalidFileFormatError as e_keepa:
@@ -177,28 +187,39 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
             st.stop()
 
         keepa_df_combined = pd.concat(all_keepa_dataframes, ignore_index=True)
+        # Usa 'Locale' e 'ASIN' che dovrebbero essere i nomi standardizzati dopo il caricamento
         keepa_df_combined.drop_duplicates(subset=['ASIN', 'Locale'], keep='last', inplace=True)
         logger.info(f"Combined and de-duplicated Keepa data from {valid_keepa_files_count} valid file(s): {len(keepa_df_combined)} rows.")
         
         keepa_df_combined['Sito_mapped'] = mapping.map_locale_to_sito_column(keepa_df_combined, 'Locale')
         
         # Rinominazione delle colonne Keepa ai nomi interni usati dall'app
+        # Usa i nomi delle colonne come vengono letti dai file (prima della pulizia prezzo)
         keepa_df_combined.rename(columns={
-            "Buy Box: Current": "buybox_price",  # Nome esatto dal file Keepa
-            "Categories: Root": "Category"      # Nome esatto dal file Keepa
-        }, inplace=True, errors='ignore')
+            "Buy Box: Current": "buybox_price",      # Nome da Excel (se usato)
+            "Buy Box 🚚: Corrente": "buybox_price", # Nome da CSV (se usato)
+            "Categories: Root": "Category",         # Nome da Excel (se usato)
+            "Categorie: Radice": "Category"         # Nome da CSV (se usato)
+        }, inplace=True, errors='ignore') # errors='ignore' è importante se una colonna non è in tutti i file
+                                          # o se un file usa un nome e un altro file usa l'altro
         
-        # PULIZIA PREZZO KEEPPA
         if 'buybox_price' in keepa_df_combined.columns:
             logger.info("Cleaning 'buybox_price' column from Keepa data...")
             keepa_df_combined['buybox_price'] = keepa_df_combined['buybox_price'].astype(str).str.replace('€', '', regex=False).str.replace(r'\s+', '', regex=True).str.replace(',', '.', regex=False)
             keepa_df_combined['buybox_price'] = pd.to_numeric(keepa_df_combined['buybox_price'], errors='coerce')
             logger.info("'buybox_price' column cleaned and converted to numeric.")
-        
+        else:
+            logger.warning("'buybox_price' (o il suo originale) non trovato nel DataFrame Keepa combinato dopo la rinominazione.")
+            keepa_df_combined['buybox_price'] = pd.NA # Aggiungi come colonna vuota se manca del tutto
+
+        if 'Category' not in keepa_df_combined.columns:
+            logger.warning("'Category' (o il suo originale) non trovato nel DataFrame Keepa combinato dopo la rinominazione.")
+            keepa_df_combined['Category'] = pd.NA # Aggiungi come colonna vuota se manca
+
         logger.info("Combined Keepa data mapped and columns renamed/cleaned.")
         
         amazon_df['Codice'] = amazon_df['Codice'].astype(str)
-        keepa_df_combined['ASIN'] = keepa_df_combined['ASIN'].astype(str) # Assicura che ASIN in keepa sia stringa
+        keepa_df_combined['ASIN'] = keepa_df_combined['ASIN'].astype(str)
 
         merged_df = pd.merge(
             amazon_df,
@@ -211,7 +232,6 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
 
         merged_df['amazon_fee_pct_col'] = float(st.session_state.last_fee_pct)
         merged_df['shipping_cost'] = pricing.calculate_initial_shipping_cost(merged_df, 'Sito')
-        
         merged_df['buybox_price'] = pd.to_numeric(merged_df['buybox_price'], errors='coerce')
 
         merged_df = pricing.update_all_calculated_columns(merged_df, float(st.session_state.last_fee_pct))
@@ -244,18 +264,11 @@ if st.session_state.processed_df is not None:
 
     gb = GridOptionsBuilder.from_dataframe(current_df)
     gb.configure_default_column(editable=False, resizable=True, sortable=True, filter=True, wrapText=False, autoHeight=False)
-    
     gb.configure_column("nostro_prezzo", editable=True, type=["numericColumn", "numberColumnFilter", "customNumericFormat"], precision=2)
     gb.configure_column("shipping_cost", editable=True, type=["numericColumn", "numberColumnFilter", "customNumericFormat"], precision=2)
     gb.configure_selection(selection_mode="multiple", use_checkbox=True)
 
-    js_row_style = JsCode("""
-    function(params) {
-        if (params.data.net_margin < 0) {
-            return { 'background-color': '#FF7F7F' };
-        }
-        return null;
-    }""")
+    js_row_style = JsCode("""function(params) { if (params.data.net_margin < 0) { return { 'background-color': '#FF7F7F' }; } return null; }""")
     gb.configure_grid_options(getRowStyle=js_row_style)
     
     currency_formatter = JsCode("""function(params) { return (params.value !== null && params.value !== undefined && !isNaN(parseFloat(params.value))) ? parseFloat(params.value).toFixed(2) + ' €' : ''; }""")
@@ -264,23 +277,12 @@ if st.session_state.processed_df is not None:
     for col_name_grid in ['buybox_price', 'diff_euro', 'nostro_prezzo', 'shipping_cost', 'net_margin']:
         if col_name_grid in current_df.columns:
             gb.configure_column(col_name_grid, valueFormatter=currency_formatter, type=["numericColumn", "numberColumnFilter"])
-    
     if 'diff_pct' in current_df.columns:
         gb.configure_column('diff_pct', valueFormatter=percentage_formatter, type=["numericColumn", "numberColumnFilter"])
 
     gridOptions = gb.build()
-
     st.header("📊 Griglia Dati Editabile")
-    grid_response = AgGrid(
-        current_df,
-        gridOptions=gridOptions,
-        update_mode=GridUpdateMode.MODEL_CHANGED,
-        fit_columns_on_grid_load=True, 
-        allow_unsafe_jscode=True,
-        height=600,
-        width='100%',
-    )
-
+    grid_response = AgGrid(current_df, gridOptions=gridOptions, update_mode=GridUpdateMode.MODEL_CHANGED, fit_columns_on_grid_load=True, allow_unsafe_jscode=True, height=600, width='100%')
     edited_df_from_grid = grid_response['data']
     selected_rows = grid_response['selected_rows']
 
@@ -289,15 +291,12 @@ if st.session_state.processed_df is not None:
         for col_edit in ['nostro_prezzo', 'shipping_cost']:
             if col_edit in edited_df_from_grid_pd.columns:
                  edited_df_from_grid_pd[col_edit] = pd.to_numeric(edited_df_from_grid_pd[col_edit], errors='coerce')
-        
         cols_to_check_for_changes = ['nostro_prezzo', 'shipping_cost']
         cols_exist_in_original = all(col in st.session_state.processed_df.columns for col in cols_to_check_for_changes)
         cols_exist_in_edited = all(col in edited_df_from_grid_pd.columns for col in cols_to_check_for_changes)
-
         if cols_exist_in_original and cols_exist_in_edited:
             original_subset = st.session_state.processed_df[cols_to_check_for_changes]
             edited_subset = edited_df_from_grid_pd[cols_to_check_for_changes]
-
             if not original_subset.equals(edited_subset):
                 logger.info("Grid data changed by user edit.")
                 recalculated_df = pricing.update_all_calculated_columns(edited_df_from_grid_pd, float(st.session_state.last_fee_pct))
@@ -315,75 +314,43 @@ if st.session_state.processed_df is not None:
         st.info(f"{len(selected_rows)} righe selezionate.")
         selected_indices = [row['_selectedRowNodeInfo']['nodeRowIndex'] for row in selected_rows]
     else:
-        st.info("Nessuna riga selezionata. Seleziona le righe dalla griglia per azioni di massa.")
+        st.info("Nessuna riga selezionata.")
         selected_indices = []
-
     col1, col2, col3 = st.columns(3)
-
     with col1:
         st.subheader("Scala Prezzo")
         scale_value = st.number_input("Valore Scala", value=0.0, step=0.01, format="%.2f", key="scale_val")
         scale_type = st.radio("Tipo Scala", ["€", "%"], key="scale_type_radio")
-        apply_scale = st.button("Applica Scala Prezzo", disabled=not selected_indices)
-
-        if apply_scale and selected_indices:
-            is_percentage = (scale_type == "%")
-            df_after_scale = pricing.apply_scale_price(
-                st.session_state.processed_df.copy(), 
-                selected_indices, 
-                scale_value, 
-                is_percentage
-            )
-            df_after_scale = pricing.update_all_calculated_columns(df_after_scale, float(st.session_state.last_fee_pct))
-            st.session_state.processed_df = df_after_scale
+        if st.button("Applica Scala Prezzo", disabled=not selected_indices):
+            df_after_scale = pricing.apply_scale_price(st.session_state.processed_df.copy(), selected_indices, scale_value, (scale_type == "%"))
+            st.session_state.processed_df = pricing.update_all_calculated_columns(df_after_scale, float(st.session_state.last_fee_pct))
             logger.info(f"Applied 'Scala Prezzo' to {len(selected_indices)} rows.")
             st.rerun()
-
     with col2:
         st.subheader("Allinea a Buy Box – Δ")
         delta_value = st.number_input("Valore Delta (Δ)", value=0.0, step=0.01, format="%.2f", key="delta_val")
         delta_type = st.radio("Tipo Delta", ["€", "%"], key="delta_type_radio")
-        apply_align = st.button("Applica Allineamento Buy Box", disabled=not selected_indices)
-
-        if apply_align and selected_indices:
-            is_percentage = (delta_type == "%")
-            df_after_align = pricing.apply_align_to_buybox(
-                st.session_state.processed_df.copy(),
-                selected_indices,
-                delta_value,
-                is_percentage
-            )
-            df_after_align = pricing.update_all_calculated_columns(df_after_align, float(st.session_state.last_fee_pct))
-            st.session_state.processed_df = df_after_align
+        if st.button("Applica Allineamento Buy Box", disabled=not selected_indices):
+            df_after_align = pricing.apply_align_to_buybox(st.session_state.processed_df.copy(), selected_indices, delta_value, (delta_type == "%"))
+            st.session_state.processed_df = pricing.update_all_calculated_columns(df_after_align, float(st.session_state.last_fee_pct))
             logger.info(f"Applied 'Allinea a Buy Box' to {len(selected_indices)} rows.")
             st.rerun()
-            
     with col3:
         st.subheader("Esporta")
         if st.button("💾 Esporta Ready Pro CSV"):
             if st.session_state.processed_df is not None and not st.session_state.processed_df.empty:
                 try:
-                    output_csv_bytes = io_layer.save_ready_pro_csv(
-                        st.session_state.processed_df,
-                        st.session_state.original_amazon_columns,
-                    )
-                    
+                    output_csv_bytes = io_layer.save_ready_pro_csv(st.session_state.processed_df, st.session_state.original_amazon_columns)
                     export_filename = f"updated_{st.session_state.amazon_filename}"
-                    st.download_button(
-                        label=f"Scarica {export_filename}",
-                        data=output_csv_bytes,
-                        file_name=export_filename,
-                        mime="text/csv",
-                    )
+                    st.download_button(label=f"Scarica {export_filename}", data=output_csv_bytes, file_name=export_filename, mime="text/csv")
                     logger.info(f"Exported data to {export_filename}.")
                     st.success(f"File {export_filename} pronto per il download.")
                 except Exception as e:
-                    st.error(f"Errore durante l'esportazione: {e}")
+                    st.error(f"Errore esportazione: {e}")
                     logger.error(f"Export error: {e}", exc_info=True)
             else:
-                st.warning("Nessun dato da esportare. Elabora prima i file.")
-
+                st.warning("Nessun dato da esportare.")
 elif not uploaded_amazon_file:
-    st.info("📈 Carica il file Inserzioni Amazon per iniziare e per estrarre gli ASIN per Keepa.")
+    st.info("📈 Carica il file Inserzioni Amazon.")
 elif not uploaded_keepa_files and uploaded_amazon_file:
      st.info("⬆️ File Amazon caricato. Ora carica i file Keepa e clicca 'Elabora Dati Principali'.")
