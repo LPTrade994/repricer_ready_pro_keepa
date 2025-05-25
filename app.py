@@ -16,23 +16,18 @@ LOG_FILE = "repricer.log"
 logger = logging.getLogger("RepricerApp")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
-    # File handler for weekly rotation
-    # Rotates every Monday (W0). backupCount can be adjusted for how many weeks of logs to keep.
     fh = TimedRotatingFileHandler(LOG_FILE, when="W0", interval=1, backupCount=4, encoding='utf-8')
     fh.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     fh.setFormatter(formatter)
     logger.addHandler(fh)
-    # Console handler for streamlit logs
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
-
 # --- Configuration Loading ---
 def load_app_config() -> dict:
-    """Loads application configuration from YAML file."""
     try:
         with open(Path(__file__).parent / "config/amazon_fees.yml", "r") as f:
             config = yaml.safe_load(f)
@@ -41,7 +36,7 @@ def load_app_config() -> dict:
     except Exception as e:
         st.error(f"Error loading configuration: {e}")
         logger.error(f"Error loading configuration: {e}")
-        return {"default_fee_pct": 15} # Fallback default
+        return {"default_fee_pct": 15}
 
 app_config = load_app_config()
 
@@ -56,15 +51,31 @@ if 'amazon_filename' not in st.session_state:
     st.session_state.amazon_filename = "ready_pro_export.csv"
 if 'last_fee_pct' not in st.session_state:
     st.session_state.last_fee_pct = app_config.get('default_fee_pct', 15)
+if 'asins_for_keepa_search' not in st.session_state: # New session state for ASINs to copy
+    st.session_state.asins_for_keepa_search = None
+if 'amazon_df_loaded' not in st.session_state: # To store the raw Amazon DF for ASIN extraction
+    st.session_state.amazon_df_loaded = None
 
 
 # --- UI Elements ---
 st.title("🏷️ Repricer Ready Pro + Keepa")
 
+# --- File Upload Section ---
 with st.sidebar:
     st.header("📂 Caricamento File")
-    keepa_file = st.file_uploader("Carica keepa.xlsx", type=["xlsx"])
-    amazon_file = st.file_uploader("Carica Inserzioni Amazon.CSV", type=["csv"])
+    
+    uploaded_amazon_file = st.file_uploader("1. Carica Inserzioni Amazon.CSV", type=["csv"], key="amazon_file_uploader")
+    
+    # Placeholder for ASIN extraction display
+    asin_extraction_placeholder = st.empty()
+
+    # Keepa files uploader
+    uploaded_keepa_files = st.file_uploader(
+        "2. Carica File Keepa (anche multipli, es. keepa_it.xlsx, keepa_fr.xlsx)", 
+        type=["xlsx"], 
+        accept_multiple_files=True,
+        key="keepa_files_uploader"
+    )
 
     st.header("⚙️ Impostazioni Globali")
     amazon_fee_pct_slider = st.slider(
@@ -72,109 +83,187 @@ with st.sidebar:
         value=st.session_state.last_fee_pct, 
         key="amazon_fee_pct_slider_key"
     )
-    
     st.session_state.last_fee_pct = amazon_fee_pct_slider
 
-    process_button = st.button("🔄 Elabora Dati", disabled=not (keepa_file and amazon_file))
+    process_button = st.button(
+        "🔄 Elabora Dati Principali", 
+        disabled=not (uploaded_amazon_file and uploaded_keepa_files) # Enable only if both types of files are present
+    )
 
-# --- Data Loading and Processing ---
-if process_button and keepa_file and amazon_file:
+# --- ASIN Extraction Logic (runs immediately after Amazon CSV upload) ---
+if uploaded_amazon_file:
+    if st.session_state.get('last_uploaded_amazon_file_name') != uploaded_amazon_file.name or st.session_state.asins_for_keepa_search is None:
+        try:
+            logger.info(f"Loading Amazon CSV '{uploaded_amazon_file.name}' for ASIN extraction...")
+            # Use a temporary copy for extraction to not interfere with later full load if needed
+            # We need to be careful here, as load_amazon_csv might alter the stream position
+            # Create a BytesIO copy for this specific operation
+            amazon_file_bytes_copy = BytesIO(uploaded_amazon_file.getvalue())
+            
+            # We only need the DataFrame part for ASIN extraction
+            # The original load_amazon_csv might perform type conversions and renaming not desired here,
+            # or we can create a simplified loader for just ASIN extraction.
+            # For now, let's try with a basic read, assuming 'Codice' and 'Sito' are present.
+            
+            temp_amazon_df_for_asins, _, _ = io_layer.load_amazon_csv(amazon_file_bytes_copy) # Full load
+            st.session_state.amazon_df_loaded = temp_amazon_df_for_asins # Store for later use if needed
+            st.session_state.amazon_filename = uploaded_amazon_file.name
+            st.session_state.original_amazon_columns, st.session_state.original_amazon_dtypes = _ , _ # Store these too
+
+            st.session_state.asins_for_keepa_search = io_layer.extract_asins_for_keepa_search(temp_amazon_df_for_asins)
+            st.session_state.last_uploaded_amazon_file_name = uploaded_amazon_file.name
+            logger.info("ASINs extracted for Keepa search.")
+            # No st.rerun() here, let the UI update naturally in the next step
+        except io_layer.InvalidFileFormatError as e:
+            asin_extraction_placeholder.error(f"Errore formato file Amazon: {e}")
+            logger.error(f"ASIN Extraction - InvalidFileFormatError: {e}")
+            st.session_state.asins_for_keepa_search = None
+            st.session_state.amazon_df_loaded = None
+        except Exception as e:
+            asin_extraction_placeholder.error(f"Errore estrazione ASIN: {e}")
+            logger.error(f"ASIN Extraction - Processing error: {e}", exc_info=True)
+            st.session_state.asins_for_keepa_search = None
+            st.session_state.amazon_df_loaded = None
+    
+    # Display extracted ASINs
+    if st.session_state.asins_for_keepa_search:
+        with asin_extraction_placeholder.container(): # Use the placeholder
+            st.subheader("📋 ASIN per Ricerca Keepa")
+            st.caption("Copia gli ASIN per ogni paese e incollali nella ricerca Bulk ASIN di Keepa.")
+            if not st.session_state.asins_for_keepa_search:
+                 st.info("Nessun ASIN trovato o mappato correttamente.")
+            for locale_code, asins_str in sorted(st.session_state.asins_for_keepa_search.items()):
+                num_asins = asins_str.count('\n') + 1 if asins_str else 0
+                if num_asins > 0:
+                    expander_title = f"{locale_code.upper()} ({mapping.LOCALE_TO_SITO_MAP.get(locale_code, 'Sconosciuto')}) - {num_asins} ASIN"
+                    with st.expander(expander_title):
+                        st.code(asins_str, language=None) # language=None for plain text with copy button
+            st.markdown("---") # Separator
+    elif st.session_state.amazon_df_loaded is not None : # File was loaded, but no ASINs extracted
+         with asin_extraction_placeholder.container():
+            st.info("File Amazon caricato, ma nessun ASIN trovato o mappabile per la ricerca Keepa.")
+            st.markdown("---")
+
+
+# --- Data Loading and Processing (Main Grid) ---
+if process_button and uploaded_amazon_file and uploaded_keepa_files:
     try:
-        logger.info("Starting data processing.")
-        st.session_state.amazon_filename = amazon_file.name
-
-        amazon_df, original_cols, original_dtypes = io_layer.load_amazon_csv(amazon_file)
-        st.session_state.original_amazon_columns = original_cols
-        st.session_state.original_amazon_dtypes = original_dtypes
-        logger.info(f"Amazon CSV loaded: {len(amazon_df)} rows.")
-
-        keepa_df = io_layer.load_keepa_xlsx(keepa_file)
-        logger.info(f"Keepa XLSX loaded: {len(keepa_df)} rows.")
-
-        # Map Locale to Sito in Keepa data
-        keepa_df['Sito_mapped'] = mapping.map_locale_to_sito_column(keepa_df, 'Locale')
-        keepa_df.rename(columns={'BuyBox_Current': 'buybox_price'}, inplace=True)
-        logger.info("Keepa data mapped and columns renamed.")
+        logger.info("Starting main data processing.")
         
-        # Merge data
-        # Ensure 'Codice' in amazon_df and 'ASIN' in keepa_df are strings for reliable merging
-        amazon_df['Codice'] = amazon_df['Codice'].astype(str)
-        keepa_df['ASIN'] = keepa_df['ASIN'].astype(str)
+        # Amazon DF should already be loaded if ASIN extraction happened
+        # Or, reload it if not already (e.g. if ASIN extraction failed or was skipped)
+        # For simplicity, we can re-use st.session_state.amazon_df_loaded if available
+        if st.session_state.amazon_df_loaded is not None and st.session_state.amazon_filename == uploaded_amazon_file.name:
+            amazon_df = st.session_state.amazon_df_loaded.copy()
+            # original_cols and original_dtypes are already in session_state
+            original_cols = st.session_state.original_amazon_columns
+            original_dtypes = st.session_state.original_amazon_dtypes
+            logger.info("Using pre-loaded Amazon DataFrame for main processing.")
+        else: # Fallback or if ASIN extraction was off / different file
+            logger.info("Reloading Amazon CSV for main processing.")
+            amazon_file_bytes_main = BytesIO(uploaded_amazon_file.getvalue())
+            amazon_df, original_cols, original_dtypes = io_layer.load_amazon_csv(amazon_file_bytes_main)
+            st.session_state.original_amazon_columns = original_cols
+            st.session_state.original_amazon_dtypes = original_dtypes
+            st.session_state.amazon_filename = uploaded_amazon_file.name
+        
+        logger.info(f"Amazon CSV for main grid: {len(amazon_df)} rows.")
+
+        # Process multiple Keepa files
+        all_keepa_dataframes = []
+        valid_keepa_files_count = 0
+        for keepa_file_single in uploaded_keepa_files:
+            try:
+                logger.info(f"Loading Keepa file: {keepa_file_single.name}")
+                df_single_keepa = io_layer.load_keepa_xlsx(keepa_file_single)
+                all_keepa_dataframes.append(df_single_keepa)
+                valid_keepa_files_count += 1
+            except io_layer.InvalidFileFormatError as e_keepa:
+                st.error(f"Errore nel file Keepa '{keepa_file_single.name}': {e_keepa}")
+                logger.error(f"InvalidFileFormatError in Keepa file '{keepa_file_single.name}': {e_keepa}")
+            except Exception as e_general_keepa:
+                st.error(f"Errore generico nel caricare il file Keepa '{keepa_file_single.name}': {e_general_keepa}")
+                logger.error(f"Generic error loading Keepa file '{keepa_file_single.name}': {e_general_keepa}", exc_info=True)
+        
+        if not all_keepa_dataframes:
+            st.error("Nessun file Keepa valido è stato caricato o processato. Impossibile continuare.")
+            logger.error("No valid Keepa files were loaded. Aborting main processing.")
+            st.session_state.processed_df = None
+            st.stop() # Stop execution if no valid Keepa data
+
+        keepa_df_combined = pd.concat(all_keepa_dataframes, ignore_index=True)
+        # Remove duplicates: if an ASIN/Locale pair appears in multiple files, keep the last one loaded.
+        keepa_df_combined.drop_duplicates(subset=['ASIN', 'Locale'], keep='last', inplace=True)
+        logger.info(f"Combined and de-duplicated Keepa data from {valid_keepa_files_count} valid file(s): {len(keepa_df_combined)} rows.")
+        
+        # Map Locale to Sito in combined Keepa data
+        keepa_df_combined['Sito_mapped'] = mapping.map_locale_to_sito_column(keepa_df_combined, 'Locale')
+        keepa_df_combined.rename(columns={'BuyBox_Current': 'buybox_price'}, inplace=True)
+        logger.info("Combined Keepa data mapped and columns renamed.")
+        
+        amazon_df['Codice'] = amazon_df['Codice'].astype(str) # Ensure type for merge
+        keepa_df_combined['ASIN'] = keepa_df_combined['ASIN'].astype(str) # Ensure type for merge
 
         merged_df = pd.merge(
             amazon_df,
-            keepa_df[['ASIN', 'Sito_mapped', 'buybox_price', 'Category']],
+            keepa_df_combined[['ASIN', 'Sito_mapped', 'buybox_price', 'Category']], # Use combined df
             left_on=['Codice', 'Sito'],
             right_on=['ASIN', 'Sito_mapped'],
             how='left'
         )
-        # Drop redundant columns from keepa_df after merge if needed
-        # merged_df.drop(columns=['ASIN_keepa_col', 'Sito_mapped_keepa_col'], inplace=True, errors='ignore')
         logger.info(f"Data merged: {len(merged_df)} rows.")
 
-        # Initialize calculated columns
         merged_df['amazon_fee_pct_col'] = float(st.session_state.last_fee_pct)
         merged_df['shipping_cost'] = pricing.calculate_initial_shipping_cost(merged_df, 'Sito')
         
-        # Convert nostro_prezzo and buybox_price to numeric, coercing errors
         merged_df['nostro_prezzo'] = pd.to_numeric(merged_df['nostro_prezzo'], errors='coerce')
         merged_df['buybox_price'] = pd.to_numeric(merged_df['buybox_price'], errors='coerce')
 
         merged_df = pricing.update_all_calculated_columns(merged_df, float(st.session_state.last_fee_pct))
-        logger.info("Calculated columns initialized.")
+        logger.info("Calculated columns initialized for the main grid.")
         
         st.session_state.processed_df = merged_df.copy()
-        st.success("Dati elaborati con successo!")
-        # st.experimental_rerun() # Use st.rerun() for newer versions
+        st.success("Dati elaborati con successo per la griglia!")
         st.rerun()
 
-    except io_layer.InvalidFileFormatError as e:
-        st.error(f"Errore formato file: {e}")
-        logger.error(f"InvalidFileFormatError: {e}")
+    except io_layer.InvalidFileFormatError as e: # For Amazon CSV during main processing
+        st.error(f"Errore formato file Amazon (Elaborazione Principale): {e}")
+        logger.error(f"Main Processing - InvalidFileFormatError Amazon: {e}")
         st.session_state.processed_df = None
     except Exception as e:
-        st.error(f"Errore durante l'elaborazione: {e}")
-        logger.error(f"Processing error: {e}", exc_info=True)
+        st.error(f"Errore durante l'elaborazione principale: {e}")
+        logger.error(f"Main Processing error: {e}", exc_info=True)
         st.session_state.processed_df = None
 
 
-# --- Display and Interaction Area ---
+# --- Display and Interaction Area (Main Grid) ---
 if st.session_state.processed_df is not None:
     current_df = st.session_state.processed_df.copy()
 
-    # Update amazon_fee_pct_col and recalculate if slider changed
-    if float(st.session_state.last_fee_pct) != current_df['amazon_fee_pct_col'].iloc[0] if not current_df.empty else False :
+    if float(st.session_state.last_fee_pct) != (current_df['amazon_fee_pct_col'].iloc[0] if not current_df.empty and 'amazon_fee_pct_col' in current_df.columns else float(st.session_state.last_fee_pct)):
         current_df['amazon_fee_pct_col'] = float(st.session_state.last_fee_pct)
         current_df = pricing.update_all_calculated_columns(current_df, float(st.session_state.last_fee_pct))
         st.session_state.processed_df = current_df.copy()
-        # st.experimental_rerun()
         st.rerun()
 
-
-    # --- AG-Grid Display ---
     gb = GridOptionsBuilder.from_dataframe(current_df)
-    gb.configure_default_column(editable=False, resizable=True, sortable=True, filter=True)
+    gb.configure_default_column(editable=False, resizable=True, sortable=True, filter=True, wrapText=False, autoHeight=False)
     
-    # Make specific columns editable
     gb.configure_column("nostro_prezzo", editable=True, type=["numericColumn", "numberColumnFilter", "customNumericFormat"], precision=2)
     gb.configure_column("shipping_cost", editable=True, type=["numericColumn", "numberColumnFilter", "customNumericFormat"], precision=2)
-
-    # Configure selection
     gb.configure_selection(selection_mode="multiple", use_checkbox=True)
 
-    # Conditional formatting for net_margin < 0
     js_row_style = JsCode("""
     function(params) {
         if (params.data.net_margin < 0) {
-            return { 'background-color': '#FF7F7F' }; // Light red
+            return { 'background-color': '#FF7F7F' };
         }
         return null;
     }""")
     gb.configure_grid_options(getRowStyle=js_row_style)
     
-    # Custom formatting for currency columns (optional, AgGrid usually handles this with type numericColumn)
-    currency_formatter = JsCode("""function(params) { return (params.value !== null && params.value !== undefined) ? parseFloat(params.value).toFixed(2) + ' €' : ''; }""")
-    percentage_formatter = JsCode("""function(params) { return (params.value !== null && params.value !== undefined) ? parseFloat(params.value).toFixed(2) + ' %' : ''; }""")
+    currency_formatter = JsCode("""function(params) { return (params.value !== null && params.value !== undefined && !isNaN(parseFloat(params.value))) ? parseFloat(params.value).toFixed(2) + ' €' : ''; }""")
+    percentage_formatter = JsCode("""function(params) { return (params.value !== null && params.value !== undefined && !isNaN(parseFloat(params.value))) ? parseFloat(params.value).toFixed(2) + ' %' : ''; }""")
 
     for col in ['buybox_price', 'diff_euro', 'nostro_prezzo', 'shipping_cost', 'net_margin']:
         if col in current_df.columns:
@@ -183,19 +272,17 @@ if st.session_state.processed_df is not None:
     if 'diff_pct' in current_df.columns:
         gb.configure_column('diff_pct', valueFormatter=percentage_formatter, type=["numericColumn", "numberColumnFilter"])
 
-
     gridOptions = gb.build()
 
     st.header("📊 Griglia Dati Editabile")
     grid_response = AgGrid(
         current_df,
         gridOptions=gridOptions,
-        update_mode=GridUpdateMode.MODEL_CHANGED, # | GridUpdateMode.VALUE_CHANGED, # Send back data on cell edit
-        fit_columns_on_grid_load=False,
-        allow_unsafe_jscode=True,  # Set to True to allow JsCode.
+        update_mode=GridUpdateMode.MODEL_CHANGED,
+        fit_columns_on_grid_load=False, # Consider True if you have few columns
+        allow_unsafe_jscode=True,
         height=600,
         width='100%',
-        # enable_enterprise_modules=True # if you have a license
     )
 
     edited_df_from_grid = grid_response['data']
@@ -203,41 +290,31 @@ if st.session_state.processed_df is not None:
 
     if edited_df_from_grid is not None:
         edited_df_from_grid_pd = pd.DataFrame(edited_df_from_grid)
-        # Ensure numeric types for edited columns
         for col in ['nostro_prezzo', 'shipping_cost']:
             if col in edited_df_from_grid_pd.columns:
                  edited_df_from_grid_pd[col] = pd.to_numeric(edited_df_from_grid_pd[col], errors='coerce')
         
-        # Check if data actually changed to prevent infinite loops
-        # Comparing all float columns can be tricky, use a tolerance or compare relevant ones
-        # For simplicity, we assume a change if grid_response['data'] is not None and AgGrid was interacted with.
-        # A more robust check would involve comparing st.session_state.processed_df with edited_df_from_grid_pd
-        # if not st.session_state.processed_df.equals(edited_df_from_grid_pd): # This can be too strict for floats
-        
-        # Heuristic: If a known editable column has changed or selection happened, consider it an interaction
-        # This part needs careful handling to avoid unnecessary recalculations / reruns.
-        # Let's assume if model_changed, it needs update.
-        
-        # A simple check: if the dataframe from grid is different in shape or has different values for key columns
-        # For now, we'll re-calculate if any cell was edited.
-        # This typically happens when the user finishes editing a cell.
-        
-        # To avoid loop, we only update if actual values that pricing depends on changed.
-        # Or, simpler: update if the dataframes differ significantly
-        # Compare based on relevant columns changing
-        cols_to_check = ['nostro_prezzo', 'shipping_cost']
-        original_subset = st.session_state.processed_df[cols_to_check]
-        edited_subset = edited_df_from_grid_pd[cols_to_check]
+        cols_to_check_for_changes = ['nostro_prezzo', 'shipping_cost']
+        # Ensure columns exist before trying to compare
+        cols_exist_in_original = all(col in st.session_state.processed_df.columns for col in cols_to_check_for_changes)
+        cols_exist_in_edited = all(col in edited_df_from_grid_pd.columns for col in cols_to_check_for_changes)
 
-        if not original_subset.equals(edited_subset): # if relevant editable cols changed
-            logger.info("Grid data changed by user edit.")
+        if cols_exist_in_original and cols_exist_in_edited:
+            original_subset = st.session_state.processed_df[cols_to_check_for_changes]
+            edited_subset = edited_df_from_grid_pd[cols_to_check_for_changes]
+
+            if not original_subset.equals(edited_subset):
+                logger.info("Grid data changed by user edit.")
+                recalculated_df = pricing.update_all_calculated_columns(edited_df_from_grid_pd, float(st.session_state.last_fee_pct))
+                st.session_state.processed_df = recalculated_df.copy()
+                st.rerun()
+        elif edited_df_from_grid_pd.shape != st.session_state.processed_df.shape: # Fallback if columns changed
+            logger.info("Grid data shape changed or key columns missing for comparison.")
             recalculated_df = pricing.update_all_calculated_columns(edited_df_from_grid_pd, float(st.session_state.last_fee_pct))
             st.session_state.processed_df = recalculated_df.copy()
-            # st.experimental_rerun()
             st.rerun()
 
 
-    # --- Toolbar Actions ---
     st.header("🛠️ Azioni di Massa")
     if selected_rows:
         st.info(f"{len(selected_rows)} righe selezionate.")
@@ -250,7 +327,7 @@ if st.session_state.processed_df is not None:
 
     with col1:
         st.subheader("Scala Prezzo")
-        scale_value = st.number_input("Valore Scala", value=0.0, step=0.01, format="%.2f")
+        scale_value = st.number_input("Valore Scala", value=0.0, step=0.01, format="%.2f", key="scale_val")
         scale_type = st.radio("Tipo Scala", ["€", "%"], key="scale_type_radio")
         apply_scale = st.button("Applica Scala Prezzo", disabled=not selected_indices)
 
@@ -265,12 +342,11 @@ if st.session_state.processed_df is not None:
             df_after_scale = pricing.update_all_calculated_columns(df_after_scale, float(st.session_state.last_fee_pct))
             st.session_state.processed_df = df_after_scale
             logger.info(f"Applied 'Scala Prezzo' to {len(selected_indices)} rows.")
-            # st.experimental_rerun()
             st.rerun()
 
     with col2:
         st.subheader("Allinea a Buy Box – Δ")
-        delta_value = st.number_input("Valore Delta (Δ)", value=0.0, step=0.01, format="%.2f")
+        delta_value = st.number_input("Valore Delta (Δ)", value=0.0, step=0.01, format="%.2f", key="delta_val")
         delta_type = st.radio("Tipo Delta", ["€", "%"], key="delta_type_radio")
         apply_align = st.button("Applica Allineamento Buy Box", disabled=not selected_indices)
 
@@ -285,7 +361,6 @@ if st.session_state.processed_df is not None:
             df_after_align = pricing.update_all_calculated_columns(df_after_align, float(st.session_state.last_fee_pct))
             st.session_state.processed_df = df_after_align
             logger.info(f"Applied 'Allinea a Buy Box' to {len(selected_indices)} rows.")
-            # st.experimental_rerun()
             st.rerun()
             
     with col3:
@@ -295,7 +370,6 @@ if st.session_state.processed_df is not None:
                 output_csv_bytes = io_layer.save_ready_pro_csv(
                     st.session_state.processed_df,
                     st.session_state.original_amazon_columns,
-                    # st.session_state.original_amazon_dtypes # Could be used for more precise type casting
                 )
                 
                 export_filename = f"updated_{st.session_state.amazon_filename}"
@@ -311,5 +385,9 @@ if st.session_state.processed_df is not None:
                 st.error(f"Errore durante l'esportazione: {e}")
                 logger.error(f"Export error: {e}", exc_info=True)
 
-else:
-    st.info("📈 Carica i file Keepa e Inserzioni Amazon per iniziare.")
+elif not uploaded_amazon_file:
+    st.info("📈 Carica il file Inserzioni Amazon per iniziare e per estrarre gli ASIN per Keepa.")
+elif not uploaded_keepa_files and uploaded_amazon_file:
+     st.info("⬆️ File Amazon caricato. Ora carica i file Keepa e clicca 'Elabora Dati Principali'.")
+elif not process_button and uploaded_amazon_file and uploaded_keepa_files : # Files loaded but not processed
+    st.info("📂 File caricati. Clicca 'Elabora Dati Principali' per visualizzare la griglia.")
