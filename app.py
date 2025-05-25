@@ -69,10 +69,9 @@ with st.sidebar:
     
     asin_extraction_placeholder = st.empty()
 
-    # Modificato per accettare CSV per Keepa
     uploaded_keepa_files = st.file_uploader(
         "2. Carica File Keepa (CSV o XLSX, anche multipli)", 
-        type=["csv", "xlsx"], # Accetta entrambi i formati
+        type=["csv", "xlsx"], 
         accept_multiple_files=True,
         key="keepa_files_uploader"
     )
@@ -161,7 +160,6 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
         for keepa_file_single in uploaded_keepa_files:
             try:
                 logger.info(f"Loading Keepa file: {keepa_file_single.name}")
-                # Determina il tipo di file e chiama la funzione di caricamento appropriata
                 if keepa_file_single.name.lower().endswith(".csv"):
                     df_single_keepa = io_layer.load_keepa_csv(keepa_file_single)
                 elif keepa_file_single.name.lower().endswith(".xlsx"):
@@ -169,7 +167,7 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
                 else:
                     st.warning(f"Formato file Keepa non supportato per '{keepa_file_single.name}'. Ignorato.")
                     logger.warning(f"Unsupported Keepa file format for '{keepa_file_single.name}'. Skipped.")
-                    continue # Salta al prossimo file
+                    continue
                 
                 all_keepa_dataframes.append(df_single_keepa)
                 valid_keepa_files_count += 1
@@ -187,21 +185,18 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
             st.stop()
 
         keepa_df_combined = pd.concat(all_keepa_dataframes, ignore_index=True)
-        # Usa 'Locale' e 'ASIN' che dovrebbero essere i nomi standardizzati dopo il caricamento
         keepa_df_combined.drop_duplicates(subset=['ASIN', 'Locale'], keep='last', inplace=True)
         logger.info(f"Combined and de-duplicated Keepa data from {valid_keepa_files_count} valid file(s): {len(keepa_df_combined)} rows.")
         
         keepa_df_combined['Sito_mapped'] = mapping.map_locale_to_sito_column(keepa_df_combined, 'Locale')
         
-        # Rinominazione delle colonne Keepa ai nomi interni usati dall'app
-        # Usa i nomi delle colonne come vengono letti dai file (prima della pulizia prezzo)
         keepa_df_combined.rename(columns={
-            "Buy Box: Current": "buybox_price",      # Nome da Excel (se usato)
-            "Buy Box 🚚: Corrente": "buybox_price", # Nome da CSV (se usato)
-            "Categories: Root": "Category",         # Nome da Excel (se usato)
-            "Categorie: Radice": "Category"         # Nome da CSV (se usato)
-        }, inplace=True, errors='ignore') # errors='ignore' è importante se una colonna non è in tutti i file
-                                          # o se un file usa un nome e un altro file usa l'altro
+            "Buy Box: Current": "buybox_price",      # Da Excel (se usato) - nome meno probabile ora
+            "Buy Box 🚚: Corrente": "buybox_price", # Da CSV Keepa - nome più probabile
+            "Categories: Root": "Category",         # Da Excel (se usato) - nome meno probabile ora
+            "Categorie: Radice": "Category",        # Nome PRECEDENTE dal CSV (potrebbe non essere più usato)
+            "Gruppo di visualizzazione del sito web: Nome": "Category" # NUOVO nome corretto da CSV Keepa
+        }, inplace=True, errors='ignore')
         
         if 'buybox_price' in keepa_df_combined.columns:
             logger.info("Cleaning 'buybox_price' column from Keepa data...")
@@ -209,17 +204,21 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
             keepa_df_combined['buybox_price'] = pd.to_numeric(keepa_df_combined['buybox_price'], errors='coerce')
             logger.info("'buybox_price' column cleaned and converted to numeric.")
         else:
-            logger.warning("'buybox_price' (o il suo originale) non trovato nel DataFrame Keepa combinato dopo la rinominazione.")
-            keepa_df_combined['buybox_price'] = pd.NA # Aggiungi come colonna vuota se manca del tutto
+            logger.warning("'buybox_price' (o il suo originale) non trovato nel DataFrame Keepa. Sarà NaN.")
+            keepa_df_combined['buybox_price'] = pd.NA
 
         if 'Category' not in keepa_df_combined.columns:
-            logger.warning("'Category' (o il suo originale) non trovato nel DataFrame Keepa combinato dopo la rinominazione.")
-            keepa_df_combined['Category'] = pd.NA # Aggiungi come colonna vuota se manca
+            logger.warning("'Category' (o il suo originale) non trovato nel DataFrame Keepa. Sarà NaN.")
+            keepa_df_combined['Category'] = pd.NA
 
         logger.info("Combined Keepa data mapped and columns renamed/cleaned.")
         
         amazon_df['Codice'] = amazon_df['Codice'].astype(str)
-        keepa_df_combined['ASIN'] = keepa_df_combined['ASIN'].astype(str)
+        if 'ASIN' in keepa_df_combined.columns: # Assicura che la colonna ASIN esista prima di convertirla
+            keepa_df_combined['ASIN'] = keepa_df_combined['ASIN'].astype(str)
+        else: # Se 'ASIN' non c'è (non dovrebbe succedere se load_keepa_csv/xlsx funziona)
+            raise KeyError("La colonna 'ASIN' non è presente nel DataFrame Keepa combinato prima del merge.")
+
 
         merged_df = pd.merge(
             amazon_df,
@@ -252,40 +251,32 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
 
 if st.session_state.processed_df is not None:
     current_df = st.session_state.processed_df.copy()
-
     fee_col_present = 'amazon_fee_pct_col' in current_df.columns
     grid_fee_value = current_df['amazon_fee_pct_col'].iloc[0] if fee_col_present and not current_df.empty else float(st.session_state.last_fee_pct)
-    
     if float(st.session_state.last_fee_pct) != grid_fee_value :
         current_df['amazon_fee_pct_col'] = float(st.session_state.last_fee_pct)
         current_df = pricing.update_all_calculated_columns(current_df, float(st.session_state.last_fee_pct))
         st.session_state.processed_df = current_df.copy()
         st.rerun()
-
     gb = GridOptionsBuilder.from_dataframe(current_df)
     gb.configure_default_column(editable=False, resizable=True, sortable=True, filter=True, wrapText=False, autoHeight=False)
     gb.configure_column("nostro_prezzo", editable=True, type=["numericColumn", "numberColumnFilter", "customNumericFormat"], precision=2)
     gb.configure_column("shipping_cost", editable=True, type=["numericColumn", "numberColumnFilter", "customNumericFormat"], precision=2)
     gb.configure_selection(selection_mode="multiple", use_checkbox=True)
-
     js_row_style = JsCode("""function(params) { if (params.data.net_margin < 0) { return { 'background-color': '#FF7F7F' }; } return null; }""")
     gb.configure_grid_options(getRowStyle=js_row_style)
-    
     currency_formatter = JsCode("""function(params) { return (params.value !== null && params.value !== undefined && !isNaN(parseFloat(params.value))) ? parseFloat(params.value).toFixed(2) + ' €' : ''; }""")
     percentage_formatter = JsCode("""function(params) { return (params.value !== null && params.value !== undefined && !isNaN(parseFloat(params.value))) ? parseFloat(params.value).toFixed(2) + ' %' : ''; }""")
-
     for col_name_grid in ['buybox_price', 'diff_euro', 'nostro_prezzo', 'shipping_cost', 'net_margin']:
         if col_name_grid in current_df.columns:
             gb.configure_column(col_name_grid, valueFormatter=currency_formatter, type=["numericColumn", "numberColumnFilter"])
     if 'diff_pct' in current_df.columns:
         gb.configure_column('diff_pct', valueFormatter=percentage_formatter, type=["numericColumn", "numberColumnFilter"])
-
     gridOptions = gb.build()
     st.header("📊 Griglia Dati Editabile")
     grid_response = AgGrid(current_df, gridOptions=gridOptions, update_mode=GridUpdateMode.MODEL_CHANGED, fit_columns_on_grid_load=True, allow_unsafe_jscode=True, height=600, width='100%')
     edited_df_from_grid = grid_response['data']
     selected_rows = grid_response['selected_rows']
-
     if edited_df_from_grid is not None:
         edited_df_from_grid_pd = pd.DataFrame(edited_df_from_grid)
         for col_edit in ['nostro_prezzo', 'shipping_cost']:
@@ -308,7 +299,6 @@ if st.session_state.processed_df is not None:
                 recalculated_df = pricing.update_all_calculated_columns(edited_df_from_grid_pd, float(st.session_state.last_fee_pct))
                 st.session_state.processed_df = recalculated_df.copy()
                 st.rerun()
-
     st.header("🛠️ Azioni di Massa")
     if selected_rows:
         st.info(f"{len(selected_rows)} righe selezionate.")
