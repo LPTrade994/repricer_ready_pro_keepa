@@ -5,6 +5,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import yaml
 from pathlib import Path
+from io import BytesIO
 
 from services import io_layer, pricing, mapping
 
