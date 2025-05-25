@@ -1,9 +1,0 @@
-pandas>=1.5.0,<3.0.0
-streamlit>=1.20.0
-streamlit-aggrid>=0.3.4.post3 
-openpyxl>=3.0.0
-PyYAML>=6.0
-pytest>=7.0.0
-# logging è parte della libreria standard di Python
-# python-dateutil (spesso una dipendenza di pandas)
-# numpy (dipendenza di pandas)
