@@ -5,7 +5,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import yaml
 from pathlib import Path
-from io import BytesIO # Import corretto
+from io import BytesIO
 
 from services import io_layer, pricing, mapping
 
@@ -56,13 +56,12 @@ if 'asins_for_keepa_search' not in st.session_state:
     st.session_state.asins_for_keepa_search = None
 if 'amazon_df_loaded' not in st.session_state:
     st.session_state.amazon_df_loaded = None
-if 'last_uploaded_amazon_file_name' not in st.session_state: # Per tracciare il nome del file Amazon
+if 'last_uploaded_amazon_file_name' not in st.session_state:
     st.session_state.last_uploaded_amazon_file_name = None
 
 # --- UI Elements ---
 st.title("🏷️ Repricer Ready Pro + Keepa")
 
-# --- File Upload Section ---
 with st.sidebar:
     st.header("📂 Caricamento File")
     
@@ -71,7 +70,7 @@ with st.sidebar:
     asin_extraction_placeholder = st.empty()
 
     uploaded_keepa_files = st.file_uploader(
-        "2. Carica File Keepa (anche multipli, es. keepa_it.xlsx, keepa_fr.xlsx)", 
+        "2. Carica File Keepa (anche multipli)", 
         type=["xlsx"], 
         accept_multiple_files=True,
         key="keepa_files_uploader"
@@ -90,76 +89,69 @@ with st.sidebar:
         disabled=not (uploaded_amazon_file and uploaded_keepa_files)
     )
 
-# --- ASIN Extraction Logic ---
 if uploaded_amazon_file:
-    # Ricrea l'estrazione ASIN solo se il file è nuovo o non è mai stata fatta
     if st.session_state.last_uploaded_amazon_file_name != uploaded_amazon_file.name or st.session_state.asins_for_keepa_search is None:
         try:
             logger.info(f"Loading Amazon CSV '{uploaded_amazon_file.name}' for ASIN extraction...")
-            amazon_file_bytes_copy = BytesIO(uploaded_amazon_file.getvalue()) # Crea una copia per non consumare l'uploader originale
+            amazon_file_bytes_copy = BytesIO(uploaded_amazon_file.getvalue())
             
             temp_amazon_df_for_asins, original_cols_temp, original_dtypes_temp = io_layer.load_amazon_csv(amazon_file_bytes_copy)
             
-            # Salva il df caricato e i metadati originali per un possibile riutilizzo nel processing principale
-            st.session_state.amazon_df_loaded = temp_amazon_df_for_asins.copy() # Salva una copia
+            st.session_state.amazon_df_loaded = temp_amazon_df_for_asins.copy()
             st.session_state.amazon_filename = uploaded_amazon_file.name
             st.session_state.original_amazon_columns = original_cols_temp
             st.session_state.original_amazon_dtypes = original_dtypes_temp
 
             st.session_state.asins_for_keepa_search = io_layer.extract_asins_for_keepa_search(temp_amazon_df_for_asins)
-            st.session_state.last_uploaded_amazon_file_name = uploaded_amazon_file.name # Aggiorna il nome del file processato
+            st.session_state.last_uploaded_amazon_file_name = uploaded_amazon_file.name
             logger.info("ASINs extracted for Keepa search.")
-            # Non fare st.rerun() qui per evitare loop, l'UI si aggiorna al prossimo ciclo
         except io_layer.InvalidFileFormatError as e:
             asin_extraction_placeholder.error(f"Errore formato file Amazon: {e}")
             logger.error(f"ASIN Extraction - InvalidFileFormatError: {e}")
             st.session_state.asins_for_keepa_search = None
             st.session_state.amazon_df_loaded = None
-            st.session_state.last_uploaded_amazon_file_name = None # Resetta se fallisce
+            st.session_state.last_uploaded_amazon_file_name = None
         except Exception as e:
             asin_extraction_placeholder.error(f"Errore estrazione ASIN: {e}")
             logger.error(f"ASIN Extraction - Processing error: {e}", exc_info=True)
             st.session_state.asins_for_keepa_search = None
             st.session_state.amazon_df_loaded = None
-            st.session_state.last_uploaded_amazon_file_name = None # Resetta se fallisce
+            st.session_state.last_uploaded_amazon_file_name = None
     
     if st.session_state.asins_for_keepa_search:
         with asin_extraction_placeholder.container():
             st.subheader("📋 ASIN per Ricerca Keepa")
             st.caption("Copia gli ASIN per ogni paese e incollali nella ricerca Bulk ASIN di Keepa.")
-            if not st.session_state.asins_for_keepa_search: # Dovrebbe essere già gestito sopra ma per sicurezza
+            if not st.session_state.asins_for_keepa_search:
                  st.info("Nessun ASIN trovato o mappato correttamente.")
             for locale_code, asins_str in sorted(st.session_state.asins_for_keepa_search.items()):
                 num_asins = asins_str.count('\n') + 1 if asins_str else 0
                 if num_asins > 0:
-                    expander_title = f"{locale_code.upper()} ({mapping.LOCALE_TO_SITO_MAP.get(locale_code, 'Sconosciuto')}) - {num_asins} ASIN"
+                    expander_title = f"{locale_code.upper()} ({mapping.LOCALE_TO_SITO_MAP.get(locale_code, locale_code)}) - {num_asins} ASIN"
                     with st.expander(expander_title):
                         st.code(asins_str, language=None)
             st.markdown("---")
-    elif st.session_state.amazon_df_loaded is not None and not st.session_state.asins_for_keepa_search: # File Amazon caricato ma nessun ASIN
+    elif st.session_state.amazon_df_loaded is not None and not st.session_state.asins_for_keepa_search:
          with asin_extraction_placeholder.container():
             st.warning("File Amazon caricato, ma nessun ASIN è stato estratto o mappato per la ricerca Keepa. Verifica il contenuto del file e la mappatura dei 'Sito'.")
             st.markdown("---")
 
-# --- Data Loading and Processing (Main Grid) ---
 if process_button and uploaded_amazon_file and uploaded_keepa_files:
     try:
         logger.info("Starting main data processing.")
         
-        # Riusa i dati Amazon già caricati se disponibili e il file non è cambiato
         if st.session_state.amazon_df_loaded is not None and st.session_state.amazon_filename == uploaded_amazon_file.name:
-            amazon_df = st.session_state.amazon_df_loaded.copy() # Usa una copia
+            amazon_df = st.session_state.amazon_df_loaded.copy()
             original_cols = st.session_state.original_amazon_columns
             original_dtypes = st.session_state.original_amazon_dtypes
             logger.info("Using pre-loaded Amazon DataFrame for main processing.")
-        else: # Altrimenti, ricarica (es. se l'estrazione ASIN è fallita o file diverso)
-            logger.info("Reloading Amazon CSV for main processing as it was not pre-loaded or changed.")
+        else:
+            logger.info("Reloading Amazon CSV for main processing.")
             amazon_file_bytes_main = BytesIO(uploaded_amazon_file.getvalue())
             amazon_df, original_cols, original_dtypes = io_layer.load_amazon_csv(amazon_file_bytes_main)
             st.session_state.original_amazon_columns = original_cols
             st.session_state.original_amazon_dtypes = original_dtypes
             st.session_state.amazon_filename = uploaded_amazon_file.name
-            # Non è necessario aggiornare amazon_df_loaded qui perché questo è il flusso principale
         
         logger.info(f"Amazon CSV for main grid: {len(amazon_df)} rows.")
 
@@ -181,7 +173,7 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
         if not all_keepa_dataframes:
             st.error("Nessun file Keepa valido è stato caricato o processato. Impossibile continuare.")
             logger.error("No valid Keepa files were loaded. Aborting main processing.")
-            st.session_state.processed_df = None # Resetta df processato
+            st.session_state.processed_df = None
             st.stop()
 
         keepa_df_combined = pd.concat(all_keepa_dataframes, ignore_index=True)
@@ -189,8 +181,13 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
         logger.info(f"Combined and de-duplicated Keepa data from {valid_keepa_files_count} valid file(s): {len(keepa_df_combined)} rows.")
         
         keepa_df_combined['Sito_mapped'] = mapping.map_locale_to_sito_column(keepa_df_combined, 'Locale')
-        keepa_df_combined.rename(columns={'BuyBox_Current': 'buybox_price', 'Categories: Root': 'Category'}, inplace=True, errors='ignore')
-
+        
+        # Rinominazione delle colonne Keepa ai nomi interni usati dall'app
+        keepa_df_combined.rename(columns={
+            "Buy Box: Current": "buybox_price",  # Nome esatto dal file Keepa
+            "Categories: Root": "Category"      # Nome esatto dal file Keepa
+        }, inplace=True, errors='ignore')
+        
         # PULIZIA PREZZO KEEPPA
         if 'buybox_price' in keepa_df_combined.columns:
             logger.info("Cleaning 'buybox_price' column from Keepa data...")
@@ -201,7 +198,7 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
         logger.info("Combined Keepa data mapped and columns renamed/cleaned.")
         
         amazon_df['Codice'] = amazon_df['Codice'].astype(str)
-        keepa_df_combined['ASIN'] = keepa_df_combined['ASIN'].astype(str)
+        keepa_df_combined['ASIN'] = keepa_df_combined['ASIN'].astype(str) # Assicura che ASIN in keepa sia stringa
 
         merged_df = pd.merge(
             amazon_df,
@@ -215,9 +212,7 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
         merged_df['amazon_fee_pct_col'] = float(st.session_state.last_fee_pct)
         merged_df['shipping_cost'] = pricing.calculate_initial_shipping_cost(merged_df, 'Sito')
         
-        # 'nostro_prezzo' è già numerico da load_amazon_csv
-        # 'buybox_price' è già numerico dalla pulizia sopra
-        merged_df['buybox_price'] = pd.to_numeric(merged_df['buybox_price'], errors='coerce') # Riapplica per sicurezza
+        merged_df['buybox_price'] = pd.to_numeric(merged_df['buybox_price'], errors='coerce')
 
         merged_df = pricing.update_all_calculated_columns(merged_df, float(st.session_state.last_fee_pct))
         logger.info("Calculated columns initialized for the main grid.")
@@ -235,12 +230,9 @@ if process_button and uploaded_amazon_file and uploaded_keepa_files:
         logger.error(f"Main Processing error: {e}", exc_info=True)
         st.session_state.processed_df = None
 
-
-# --- Display and Interaction Area (Main Grid) ---
 if st.session_state.processed_df is not None:
     current_df = st.session_state.processed_df.copy()
 
-    # Verifica se il df attuale ha la colonna commissioni e se è diversa dal valore dello slider
     fee_col_present = 'amazon_fee_pct_col' in current_df.columns
     grid_fee_value = current_df['amazon_fee_pct_col'].iloc[0] if fee_col_present and not current_df.empty else float(st.session_state.last_fee_pct)
     
@@ -303,7 +295,6 @@ if st.session_state.processed_df is not None:
         cols_exist_in_edited = all(col in edited_df_from_grid_pd.columns for col in cols_to_check_for_changes)
 
         if cols_exist_in_original and cols_exist_in_edited:
-            # Creare subset solo se le colonne esistono per evitare KeyError
             original_subset = st.session_state.processed_df[cols_to_check_for_changes]
             edited_subset = edited_df_from_grid_pd[cols_to_check_for_changes]
 
@@ -314,9 +305,7 @@ if st.session_state.processed_df is not None:
                 st.rerun()
         elif edited_df_from_grid_pd.shape != st.session_state.processed_df.shape or not cols_exist_in_original or not cols_exist_in_edited :
             logger.info("Grid data shape changed or key columns missing/mismatch for comparison.")
-            # Potrebbe essere necessario gestire questo caso con più attenzione,
-            # per ora ricalcola se la forma cambia o le colonne non corrispondono.
-            if not edited_df_from_grid_pd.empty: # Solo se il df dalla griglia non è vuoto
+            if not edited_df_from_grid_pd.empty:
                 recalculated_df = pricing.update_all_calculated_columns(edited_df_from_grid_pd, float(st.session_state.last_fee_pct))
                 st.session_state.processed_df = recalculated_df.copy()
                 st.rerun()
@@ -376,7 +365,7 @@ if st.session_state.processed_df is not None:
                 try:
                     output_csv_bytes = io_layer.save_ready_pro_csv(
                         st.session_state.processed_df,
-                        st.session_state.original_amazon_columns, # Passa le colonne originali per l'export
+                        st.session_state.original_amazon_columns,
                     )
                     
                     export_filename = f"updated_{st.session_state.amazon_filename}"
@@ -398,6 +387,3 @@ elif not uploaded_amazon_file:
     st.info("📈 Carica il file Inserzioni Amazon per iniziare e per estrarre gli ASIN per Keepa.")
 elif not uploaded_keepa_files and uploaded_amazon_file:
      st.info("⬆️ File Amazon caricato. Ora carica i file Keepa e clicca 'Elabora Dati Principali'.")
-# Questa condizione potrebbe non essere più necessaria se il process_button gestisce il flusso
-# elif not process_button and uploaded_amazon_file and uploaded_keepa_files :
-#     st.info("📂 File caricati. Clicca 'Elabora Dati Principali' per visualizzare la griglia.")

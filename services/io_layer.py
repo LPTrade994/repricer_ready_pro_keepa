@@ -10,27 +10,51 @@ class InvalidFileFormatError(ValueError):
 def load_keepa_xlsx(uploaded_file: BytesIO) -> pd.DataFrame:
     """
     Loads data from a Keepa XLSX file.
+    It expects specific column names from your Keepa export: 
+    "ASIN", "Locale", "Buy Box: Current", "Categories: Root".
 
     Args:
         uploaded_file: The uploaded XLSX file object.
 
     Returns:
-        A pandas DataFrame with Keepa data.
+        A pandas DataFrame with Keepa data. Original column names like 
+        "Buy Box: Current" and "Categories: Root" are preserved at this stage.
+        Renaming happens later in app.py.
         
     Raises:
         InvalidFileFormatError: If required columns are missing.
     """
     try:
         df = pd.read_excel(uploaded_file)
-        required_cols_keepa = ['ASIN', 'Locale', 'BuyBox_Current', 'Category'] # Specific for Keepa
-        missing_cols = [col for col in required_cols_keepa if col not in df.columns]
-        if missing_cols:
-            raise InvalidFileFormatError(f"File Keepa ('{uploaded_file.name}'): Colonne mancanti: {', '.join(missing_cols)}")
+
+        # Define the actual column names from your Keepa Excel export
+        actual_asin_col_k = "ASIN"
+        actual_locale_col_k = "Locale"
+        actual_buybox_col_k = "Buy Box: Current" 
+        actual_category_col_k = "Categories: Root"
         
-        if 'ASIN' in df.columns:
-            df['ASIN'] = df['ASIN'].astype(str)
-        if 'Locale' in df.columns:
-            df['Locale'] = df['Locale'].astype(str).str.lower()
+        required_actual_cols_keepa = [
+            actual_asin_col_k, 
+            actual_locale_col_k, 
+            actual_buybox_col_k, 
+            actual_category_col_k
+        ]
+        
+        missing_cols = [col for col in required_actual_cols_keepa if col not in df.columns]
+        if missing_cols:
+            expected_cols_msg = f"ASIN='{actual_asin_col_k}', Locale='{actual_locale_col_k}', BuyBox='{actual_buybox_col_k}', Category='{actual_category_col_k}'"
+            raise InvalidFileFormatError(f"File Keepa ('{uploaded_file.name}'): Colonne mancanti. Attese: {expected_cols_msg}. Trovate: {', '.join(df.columns)}. Mancanti: {', '.join(missing_cols)}")
+        
+        # Standardize ASIN and Locale types/values
+        if actual_asin_col_k in df.columns:
+            df[actual_asin_col_k] = df[actual_asin_col_k].astype(str)
+        if actual_locale_col_k in df.columns:
+            df[actual_locale_col_k] = df[actual_locale_col_k].astype(str).str.lower()
+        
+        # The columns "Buy Box: Current" and "Categories: Root" will be renamed 
+        # to "buybox_price" and "Category" respectively in app.py after all Keepa
+        # files are loaded and concatenated.
+
         return df
     except Exception as e:
         if isinstance(e, InvalidFileFormatError):
@@ -61,7 +85,7 @@ def load_amazon_csv(uploaded_file: BytesIO) -> Tuple[pd.DataFrame, List[str], Di
         try:
             content = uploaded_file.getvalue().decode('utf-8')
         except UnicodeDecodeError:
-            uploaded_file.seek(0)
+            uploaded_file.seek(0) # Reset buffer position
             content = uploaded_file.getvalue().decode('latin1')
         
         # Read the CSV
@@ -73,34 +97,35 @@ def load_amazon_csv(uploaded_file: BytesIO) -> Tuple[pd.DataFrame, List[str], Di
         # Define the actual column names from your CSV
         actual_asin_column_name = "Codice(ASIN)"
         actual_price_column_name = "Prz.aggiornato"
-        # Other required columns (standardized names used internally)
-        internal_sku_column_name = "SKU" # Assuming "SKU" is the actual name in your CSV
-        internal_sito_column_name = "Sito" # Assuming "Sito" is the actual name in your CSV
+        # Other required columns (using their actual names from your CSV for checking)
+        actual_sku_column_name = "SKU" # Assuming "SKU" is the actual name in your CSV
+        actual_sito_column_name = "Sito" # Assuming "Sito" is the actual name in your CSV
 
         # Check for the presence of these actual column names
-        required_actual_cols = [internal_sku_column_name, actual_asin_column_name, internal_sito_column_name, actual_price_column_name]
+        required_actual_cols = [actual_sku_column_name, actual_asin_column_name, actual_sito_column_name, actual_price_column_name]
         missing_cols = [col for col in required_actual_cols if col not in df.columns]
         if missing_cols:
-            # Provide a more informative error message about the expected actual column names
-            expected_cols_message = f"SKU='{internal_sku_column_name}', ASIN='{actual_asin_column_name}', Sito='{internal_sito_column_name}', Prezzo='{actual_price_column_name}'"
+            expected_cols_message = f"SKU='{actual_sku_column_name}', ASIN='{actual_asin_column_name}', Sito='{actual_sito_column_name}', Prezzo='{actual_price_column_name}'"
             raise InvalidFileFormatError(f"File Inserzioni Amazon: Colonne mancanti. Attese: {expected_cols_message}. Trovate: {', '.join(df.columns)}. Mancanti: {', '.join(missing_cols)}")
 
         # Rename actual columns to internal standard names
         df.rename(columns={
             actual_asin_column_name: 'Codice', 
             actual_price_column_name: 'nostro_prezzo'
+            # SKU and Sito are already standard if their actual names are "SKU" and "Sito"
         }, inplace=True)
 
         # Convert 'nostro_prezzo' to numeric
-        if df['nostro_prezzo'].dtype == 'object':
+        if 'nostro_prezzo' in df.columns and df['nostro_prezzo'].dtype == 'object':
             # Remove potential thousands separators (like apostrophes in prices like "2'641,47")
+            # and then convert comma decimal to dot decimal.
             df['nostro_prezzo'] = df['nostro_prezzo'].astype(str).str.replace("'", "", regex=False).str.replace(',', '.', regex=False)
             df['nostro_prezzo'] = pd.to_numeric(df['nostro_prezzo'], errors='coerce')
 
         # Ensure 'Codice' (ASIN) and 'Sito' are strings
         if 'Codice' in df.columns:
             df['Codice'] = df['Codice'].astype(str)
-        if 'Sito' in df.columns: # 'Sito' is already one of our internal names
+        if 'Sito' in df.columns: 
             df['Sito'] = df['Sito'].astype(str)
 
         return df, original_columns, original_dtypes
@@ -127,7 +152,6 @@ def extract_asins_for_keepa_search(amazon_df: pd.DataFrame) -> Dict[str, str]:
                         Returns an empty dictionary if 'Codice' or 'Sito' are missing.
     """
     if 'Codice' not in amazon_df.columns or 'Sito' not in amazon_df.columns:
-        # This should not happen if load_amazon_csv ran successfully
         return {}
 
     df_copy = amazon_df[['Codice', 'Sito']].copy()
@@ -146,68 +170,53 @@ def extract_asins_for_keepa_search(amazon_df: pd.DataFrame) -> Dict[str, str]:
 def save_ready_pro_csv(df: pd.DataFrame, original_columns: List[str]) -> bytes:
     """
     Saves the DataFrame to a CSV string in Ready Pro format.
-    Renames internal 'nostro_prezzo' back to its original name in the export CSV
-    if the original price column name was different (e.g., "Prz.aggiornato").
+    Renames internal columns like 'nostro_prezzo' and 'Codice' back to their 
+    original names as found in the input 'Inserzioni Amazon.CSV' for export.
 
     Args:
-        df: The DataFrame to save. Must contain 'nostro_prezzo' and other original columns.
-        original_columns: The list of original column names in desired order.
-                          The original price column name (e.g., "Prz.aggiornato") should be in this list.
+        df: The DataFrame to save. Must contain internal columns like 'nostro_prezzo'.
+        original_columns: The list of original column names from 'Inserzioni Amazon.CSV'.
 
     Returns:
         bytes: The CSV data as bytes, encoded in UTF-8-BOM.
     """
     export_df = df.copy()
     
-    # Determine the original price column name.
-    # This logic assumes that if "Prz.aggiornato" was in original_columns, it was the price.
-    # A more robust way might be to store the original name of the price column during load.
-    # For now, let's assume if "Prezzo" is not in original_columns, but "Prz.aggiornato" is, use that.
-    original_price_col_name = "Prezzo" # Default
-    if "Prz.aggiornato" in original_columns:
-        original_price_col_name = "Prz.aggiornato"
-    elif "Prezzo" not in original_columns and any("Prz" in col for col in original_columns):
-        # Heuristic: find a column with "Prz" if "Prezzo" or "Prz.aggiornato" aren't explicitly there.
-        # This part can be risky and might need refinement based on actual CSV variations.
-        potential_price_cols = [col for col in original_columns if "Prz" in col]
-        if potential_price_cols:
-            original_price_col_name = potential_price_cols[0] # Take the first match
+    # Determine the original price column name from the input CSV
+    original_price_col_name_in_csv = "Prz.aggiornato" # As per user's CSV structure
+    internal_price_col_name = "nostro_prezzo"
 
-    if 'nostro_prezzo' in export_df.columns and original_price_col_name in original_columns:
-        export_df.rename(columns={'nostro_prezzo': original_price_col_name}, inplace=True)
-    elif 'nostro_prezzo' in export_df.columns and 'Prezzo' in original_columns: # Fallback if dynamic renaming failed
-         export_df.rename(columns={'nostro_prezzo': 'Prezzo'}, inplace=True)
+    if internal_price_col_name in export_df.columns and original_price_col_name_in_csv in original_columns:
+        if internal_price_col_name != original_price_col_name_in_csv:
+             export_df.rename(columns={internal_price_col_name: original_price_col_name_in_csv}, inplace=True)
+    # Fallback if "Prz.aggiornato" wasn't somehow in original_columns but "Prezzo" was (legacy or different format)
+    elif internal_price_col_name in export_df.columns and "Prezzo" in original_columns:
+         export_df.rename(columns={internal_price_col_name: "Prezzo"}, inplace=True)
     
     
-    # Rename 'Codice' back to 'Codice(ASIN)' if that was the original
-    original_asin_col_name = "Codice" # Default
-    if "Codice(ASIN)" in original_columns:
-        original_asin_col_name = "Codice(ASIN)"
+    # Determine the original ASIN column name from the input CSV
+    original_asin_col_name_in_csv = "Codice(ASIN)" # As per user's CSV structure
+    internal_asin_col_name = "Codice"
 
-    if 'Codice' in export_df.columns and original_asin_col_name in original_columns and 'Codice' != original_asin_col_name:
-        export_df.rename(columns={'Codice': original_asin_col_name}, inplace=True)
-
+    if internal_asin_col_name in export_df.columns and original_asin_col_name_in_csv in original_columns:
+        if internal_asin_col_name != original_asin_col_name_in_csv:
+            export_df.rename(columns={internal_asin_col_name: original_asin_col_name_in_csv}, inplace=True)
 
     # Select only original columns in original order
-    # Make sure all original columns are present for the export
+    # This ensures the output CSV matches the input CSV's column structure and order.
     final_export_columns = []
     for col_name in original_columns:
         if col_name in export_df.columns:
             final_export_columns.append(col_name)
-        # else: # If a column is critical and missing (should not happen if logic is correct)
-            # export_df[col_name] = pd.NA 
+        # else: # If an original column is somehow missing from export_df, add it as empty
+            # export_df[col_name] = pd.NA # Or some default
 
     export_df = export_df[final_export_columns]
 
     # Ensure the price column (whatever its original name was) is rounded to 2 decimal places
-    if original_price_col_name in export_df.columns and export_df[original_price_col_name].dtype in ['float', 'float64']:
-        export_df[original_price_col_name] = export_df[original_price_col_name].round(2)
-    # Also round other float columns if necessary, but be careful not to over-round non-currency floats.
-    # for col in export_df.select_dtypes(include=['float', 'float64']).columns:
-    #     if col != original_price_col_name: # Example: don't re-round price if already handled
-    #         # export_df[col] = export_df[col].round(some_other_precision_if_needed)
-    #         pass
-
+    price_col_for_rounding = original_price_col_name_in_csv if original_price_col_name_in_csv in export_df.columns else ("Prezzo" if "Prezzo" in export_df.columns else None)
+    if price_col_for_rounding and export_df[price_col_for_rounding].dtype in ['float', 'float64']:
+        export_df[price_col_for_rounding] = export_df[price_col_for_rounding].round(2)
 
     bytes_buffer = BytesIO()
     export_df.to_csv(bytes_buffer, sep=';', decimal=',', index=False, encoding='utf-8-sig')
